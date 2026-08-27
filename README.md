@@ -55,90 +55,21 @@ Get-FileHash .\caddy_2.11.4_cloudns_1.2.0_windows_amd64.zip -Algorithm SHA256
 Replace the example version numbers with the versions in the release you
 downloaded.
 
-## Install
+## Documentation
 
-### Linux
-
-Extract the archive and install the executable. For example:
-
-```sh
-tar -xzf caddy_2.11.4_cloudns_1.2.0_linux_amd64.tar.gz
-sudo install -m 0755 caddy /usr/local/bin/caddy
-caddy version
-```
-
-To verify that the DNS provider is included:
-
-```sh
-caddy list-modules | grep dns.providers.cloudns
-```
-
-### Windows
-
-Extract the ZIP archive. For example, in PowerShell:
-
-```powershell
-Expand-Archive .\caddy_2.11.4_cloudns_1.2.0_windows_amd64.zip -DestinationPath .\caddy
-.\caddy\caddy.exe version
-```
-
-Add the extracted directory to `PATH` if you want to invoke `caddy.exe` from
-any directory.
-
-## Configure ClouDNS
-
-The module provides the Caddy module `dns.providers.cloudns`. Configure the
-ClouDNS API credentials in the environment of the Caddy process:
-
-- `CLOUDNS_AUTH_ID`, or `CLOUDNS_SUB_AUTH_ID`
-- `CLOUDNS_AUTH_PASSWORD`
-
-Then use the DNS challenge in a Caddyfile:
-
-```Caddyfile
-example.com {
-    tls {
-        dns cloudns
-    }
-}
-```
-
-The build workflow does not use ClouDNS credentials; they are only needed when
-Caddy runs and provisions a certificate.
-
-See the [ClouDNS module documentation](https://github.com/caddy-dns/cloudns)
-for API restrictions, explicit credential configuration, and retry settings.
-
-## Build locally
-
-Install Go and `xcaddy`, then build with an explicit output name:
-
-```sh
-go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-xcaddy build v2.11.4 \
-    --with github.com/caddy-dns/cloudns@v1.2.0 \
-    --output caddy
-```
-
-To cross-compile for Windows, set `GOOS`/`GOARCH` and use an `.exe` output name:
-
-```sh
-GOOS=windows GOARCH=amd64 xcaddy build v2.11.4 \
-    --with github.com/caddy-dns/cloudns@v1.2.0 \
-    --output caddy.exe
-```
+- [Caddy documentation](https://caddyserver.com/docs/)
+- [ClouDNS module documentation](https://github.com/caddy-dns/cloudns)
 
 ## Release tags
 
-Release tags use this format:
+Release tags include both the Caddy and ClouDNS module versions:
 
 ```text
-caddy-v2.11.4-cloudns
+caddy-v2.11.4-cloudns-v1.2.0
 ```
 
-The release notes identify the exact ClouDNS module version used in that
-build. A release is created only after all four platform archives have built,
-passed validation, and uploaded successfully.
+A release is created only after all four platform archives have built, passed
+validation, and uploaded successfully.
 
 ## License and disclaimer
 

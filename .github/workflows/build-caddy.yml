@@ -63,9 +63,9 @@ jobs:
           require_stable_release "Caddy" "$caddy_release" "$caddy_tag"
           require_stable_release "ClouDNS" "$cloudns_release" "$cloudns_tag"
 
-          # The release identity is based on Caddy only. A new ClouDNS release
-          # is used by the next Caddy build, but does not trigger one by itself.
-          release_tag="caddy-${caddy_tag}-cloudns"
+          # Include both upstream versions in the release identity so each
+          # published build can be identified unambiguously.
+          release_tag="caddy-${caddy_tag}-cloudns-${cloudns_tag}"
 
           # Only treat a genuine 404 as "no release exists". Any other failure
           # (rate limiting, auth, network, server errors) must not be silently
