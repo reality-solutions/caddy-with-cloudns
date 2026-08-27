@@ -25,9 +25,8 @@ The current build targets are:
 | Windows | AMD64 | `.zip` | `caddy.exe` |
 | Windows | ARM64 | `.zip` | `caddy.exe` |
 
-Each archive places the executable at its root. The executable names are
-always `caddy` for Linux and `caddy.exe` for Windows. They are not derived from
-the release tag.
+Each archive places the executable at its root, named `caddy` or `caddy.exe`
+(not the versioned archive name).
 
 Archives also include:
 
@@ -36,8 +35,6 @@ Archives also include:
 - `LICENSE-CADDY`
 - `LICENSE-CLOUDNS`
 - `CADDY-VERSION.txt`
-
-macOS builds are not currently published.
 
 ## Verify a download
 
@@ -106,9 +103,8 @@ example.com {
 }
 ```
 
-The build workflow does not use ClouDNS credentials and never performs DNS
-operations. Credentials are only needed when Caddy runs and provisions a
-certificate.
+The build workflow does not use ClouDNS credentials; they are only needed when
+Caddy runs and provisions a certificate.
 
 See the [ClouDNS module documentation](https://github.com/caddy-dns/cloudns)
 for API restrictions, explicit credential configuration, and retry settings.
@@ -124,17 +120,13 @@ xcaddy build v2.11.4 \
     --output caddy
 ```
 
-For a Windows build, set the target and output name explicitly:
+To cross-compile for Windows, set `GOOS`/`GOARCH` and use an `.exe` output name:
 
 ```sh
 GOOS=windows GOARCH=amd64 xcaddy build v2.11.4 \
     --with github.com/caddy-dns/cloudns@v1.2.0 \
     --output caddy.exe
 ```
-
-The workflow uses the latest stable ClouDNS release when it builds a new Caddy
-release. It does not create a new build only because ClouDNS released a new
-version; that version is picked up by the next Caddy build.
 
 ## Release tags
 
