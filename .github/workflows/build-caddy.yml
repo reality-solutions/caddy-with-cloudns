@@ -1,0 +1,394 @@
+name: Build Caddy with ClouDNS
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: caddy-cloudns-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  XCADDY_VERSION: v0.4.7
+  CLOUDNS_MODULE: github.com/caddy-dns/cloudns
+  # Pinned exact Go version so every matrix job (and every rerun of the same
+  # Caddy/ClouDNS release) uses an identical toolchain. Update deliberately
+  # rather than floating on "stable".
+  GO_VERSION: '1.27.0'
+
+jobs:
+  detect:
+    name: Detect stable releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      caddy_tag: ${{ steps.releases.outputs.caddy_tag }}
+      cloudns_tag: ${{ steps.releases.outputs.cloudns_tag }}
+      release_tag: ${{ steps.releases.outputs.release_tag }}
+      should_build: ${{ steps.releases.outputs.should_build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Select the latest stable Caddy and ClouDNS releases
+        id: releases
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fail unless a release is a published, stable (non-draft,
+          # non-prerelease) version tagged like "v1.2.3".
+          require_stable_release() {
+            local name="$1" release="$2" tag="$3"
+            if [[ "$(jq -r '.draft' <<<"$release")" != "false" || \
+                  "$(jq -r '.prerelease' <<<"$release")" != "false" ]]; then
+              echo "The latest $name release is not a published stable release." >&2
+              exit 1
+            fi
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Unexpected $name release tag: $tag" >&2
+              exit 1
+            fi
+          }
+
+          caddy_release="$(gh api repos/caddyserver/caddy/releases/latest)"
+          cloudns_release="$(gh api repos/caddy-dns/cloudns/releases/latest)"
+
+          caddy_tag="$(jq -r '.tag_name' <<<"$caddy_release")"
+          cloudns_tag="$(jq -r '.tag_name' <<<"$cloudns_release")"
+
+          require_stable_release "Caddy" "$caddy_release" "$caddy_tag"
+          require_stable_release "ClouDNS" "$cloudns_release" "$cloudns_tag"
+
+          # The release identity is based on Caddy only. A new ClouDNS release
+          # is used by the next Caddy build, but does not trigger one by itself.
+          release_tag="caddy-${caddy_tag}-cloudns"
+
+          # Only treat a genuine 404 as "no release exists". Any other failure
+          # (rate limiting, auth, network, server errors) must not be silently
+          # interpreted as an absent release, since that could later cause the
+          # publish job to mutate or delete assets from a release that does
+          # exist.
+          lookup_error="$(mktemp)"
+          trap 'rm -f "$lookup_error"' EXIT
+
+          set +e
+          existing_release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" 2>"$lookup_error")"
+          lookup_status=$?
+          set -e
+
+          if [[ $lookup_status -ne 0 ]]; then
+            if grep -q 'HTTP 404' "$lookup_error"; then
+              existing_release=""
+            else
+              echo "Failed to look up existing release for tag $release_tag:" >&2
+              cat "$lookup_error" >&2
+              exit 1
+            fi
+          fi
+
+          should_build=true
+
+          if [[ -n "$existing_release" && \
+                "$(jq -r '.draft' <<<"$existing_release")" == "false" && \
+                "$(jq -r '.prerelease' <<<"$existing_release")" == "false" ]]; then
+            should_build=false
+            echo "A published release already exists for Caddy $caddy_tag."
+          elif [[ -n "$existing_release" ]]; then
+            echo "An incomplete release exists for $release_tag; it will be rebuilt."
+          else
+            echo "No release exists for Caddy $caddy_tag; a build is required."
+          fi
+
+          {
+            echo "caddy_tag=$caddy_tag"
+            echo "cloudns_tag=$cloudns_tag"
+            echo "release_tag=$release_tag"
+            echo "should_build=$should_build"
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            goos: linux
+            goarch: amd64
+            binary: caddy
+            archive: tar.gz
+            artifact: linux-amd64
+          - platform: linux_arm64
+            goos: linux
+            goarch: arm64
+            binary: caddy
+            archive: tar.gz
+            artifact: linux-arm64
+          - platform: windows_amd64
+            goos: windows
+            goarch: amd64
+            binary: caddy.exe
+            archive: zip
+            artifact: windows-amd64
+          - platform: windows_arm64
+            goos: windows
+            goarch: arm64
+            binary: caddy.exe
+            archive: zip
+            artifact: windows-arm64
+    env:
+      CADDY_TAG: ${{ needs.detect.outputs.caddy_tag }}
+      CLOUDNS_TAG: ${{ needs.detect.outputs.cloudns_tag }}
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install xcaddy
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}"
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+
+      - name: Build and package Caddy
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          BINARY: ${{ matrix.binary }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCHIVE_FORMAT: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist package releases
+          output="dist/$BINARY"
+
+          xcaddy build "$CADDY_TAG" \
+            --with "${CLOUDNS_MODULE}@${CLOUDNS_TAG}" \
+            --output "$output"
+
+          cp "$output" "package/$BINARY"
+
+          go version -m "$output" | tee package/GO-MODULES.txt
+          grep -Fq "$CLOUDNS_MODULE" package/GO-MODULES.txt
+
+          if [[ "$GOOS" == "linux" && "$GOARCH" == "amd64" ]]; then
+            "$output" version | tee package/CADDY-VERSION.txt
+            grep -Fq "$CADDY_TAG" package/CADDY-VERSION.txt
+            "$output" list-modules | grep -Fxq 'dns.providers.cloudns'
+          else
+            printf '%s\n' "$CADDY_TAG" >package/CADDY-VERSION.txt
+          fi
+
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://raw.githubusercontent.com/caddyserver/caddy/${CADDY_TAG}/LICENSE" \
+            --output package/LICENSE-CADDY
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://raw.githubusercontent.com/caddy-dns/cloudns/${CLOUDNS_TAG}/LICENSE" \
+            --output package/LICENSE-CLOUDNS
+
+          xcaddy_version="$(xcaddy version)"
+          {
+            echo "Caddy: $CADDY_TAG"
+            echo "ClouDNS module: $CLOUDNS_TAG"
+            echo "xcaddy: $xcaddy_version"
+            echo "Go: $(go version)"
+            echo "Target: $GOOS/$GOARCH"
+            echo "CGO_ENABLED: 0"
+          } | tee package/BUILD-METADATA.txt
+
+          caddy_version="${CADDY_TAG#v}"
+          cloudns_version="${CLOUDNS_TAG#v}"
+          archive_name="caddy_${caddy_version}_cloudns_${cloudns_version}_${PLATFORM}"
+          expected_files=("$BINARY" BUILD-METADATA.txt CADDY-VERSION.txt LICENSE-CADDY LICENSE-CLOUDNS GO-MODULES.txt)
+
+          if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
+            archive_path="releases/${archive_name}.zip"
+            (cd package && zip -q "../$archive_path" "${expected_files[@]}")
+            mapfile -t archive_files < <(unzip -Z1 "$archive_path" | sort)
+          else
+            archive_path="releases/${archive_name}.tar.gz"
+            tar -czf "$archive_path" -C package "${expected_files[@]}"
+            mapfile -t archive_files < <(tar -tzf "$archive_path" | sort)
+          fi
+
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected_files[@]}" | sort)
+          if [[ "${archive_files[*]}" != "${expected_sorted[*]}" ]]; then
+            echo "Unexpected archive contents in $archive_path" >&2
+            printf 'Expected:\n%s\n' "${expected_sorted[*]}" >&2
+            printf 'Found:\n%s\n' "${archive_files[*]}" >&2
+            exit 1
+          fi
+
+          echo "Created $archive_path with executable $BINARY at the archive root."
+
+      - name: Upload packaged build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: releases/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [detect, build]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CADDY_TAG: ${{ needs.detect.outputs.caddy_tag }}
+      CLOUDNS_TAG: ${{ needs.detect.outputs.cloudns_tag }}
+      RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+    steps:
+      - name: Download packaged builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate assets and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          caddy_version="${CADDY_TAG#v}"
+          cloudns_version="${CLOUDNS_TAG#v}"
+          expected_files=(
+            "caddy_${caddy_version}_cloudns_${cloudns_version}_linux_amd64.tar.gz"
+            "caddy_${caddy_version}_cloudns_${cloudns_version}_linux_arm64.tar.gz"
+            "caddy_${caddy_version}_cloudns_${cloudns_version}_windows_amd64.zip"
+            "caddy_${caddy_version}_cloudns_${cloudns_version}_windows_arm64.zip"
+          )
+
+          for file in "${expected_files[@]}"; do
+            test -f "release-assets/$file"
+          done
+
+          actual_count="$(find release-assets -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+          if [[ "$actual_count" -ne "${#expected_files[@]}" ]]; then
+            echo "Expected ${#expected_files[@]} archives, found $actual_count." >&2
+            find release-assets -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum -- *.tar.gz *.zip
+          ) >checksums.txt
+
+          cat checksums.txt
+
+      - name: Write release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "release_title=Caddy ${CADDY_TAG} with ClouDNS" >>"$GITHUB_OUTPUT"
+
+          cat >release-notes.md <<EOF
+          # Caddy ${CADDY_TAG} with ClouDNS
+
+          This is an unofficial Caddy build with the ClouDNS DNS provider module.
+
+          - Caddy: [${CADDY_TAG}](https://github.com/caddyserver/caddy/releases/tag/${CADDY_TAG})
+          - ClouDNS module: [${CLOUDNS_TAG}](https://github.com/caddy-dns/cloudns/releases/tag/${CLOUDNS_TAG})
+          - xcaddy: ${XCADDY_VERSION}
+          - Platforms: Linux AMD64, Linux ARM64, Windows AMD64, and Windows ARM64
+
+          Each archive contains the executable at its root. Unix archives contain
+          a file named caddy; Windows archives contain a file named caddy.exe.
+          SHA-256 checksums are provided in checksums.txt.
+
+          These binaries are not official Caddy releases and are not endorsed by
+          Caddy or ClouDNS. See the included license files and the project README
+          for attribution and usage information.
+          EOF
+
+      - name: Create or update draft release
+        id: release
+        shell: bash
+        env:
+          RELEASE_TITLE: ${{ steps.notes.outputs.release_title }}
+        run: |
+          set -euo pipefail
+
+          release_body="$(<release-notes.md)"
+          releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          release_json="$(jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)] | first // empty' <<<"$releases")"
+
+          if [[ -z "$release_json" ]]; then
+            release_json="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f "tag_name=$RELEASE_TAG" \
+              -f "name=$RELEASE_TITLE" \
+              -f "body=$release_body" \
+              -F draft=true \
+              -F prerelease=false)"
+          else
+            release_id="$(jq -r '.id' <<<"$release_json")"
+            release_json="$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+              -f "name=$RELEASE_TITLE" \
+              -f "body=$release_body" \
+              -F draft=true \
+              -F prerelease=false)"
+          fi
+
+          {
+            echo "release_id=$(jq -r '.id' <<<"$release_json")"
+            echo "upload_url=$(jq -r '.upload_url' <<<"$release_json")"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          existing_assets="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${{ steps.release.outputs.release_id }}/assets?per_page=100" --jq '.[].id')"
+          while IFS= read -r asset_id; do
+            [[ -z "$asset_id" ]] || gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
+          done <<<"$existing_assets"
+
+          upload_url="${{ steps.release.outputs.upload_url }}"
+          upload_url="${upload_url%\{*}"
+          for asset in release-assets/* checksums.txt; do
+            asset_name="$(basename "$asset")"
+            gh api --method POST "${upload_url}?name=${asset_name}" \
+              -H 'Content-Type: application/octet-stream' \
+              --input "$asset" >/dev/null
+          done
+
+      - name: Publish release
+        shell: bash
+        env:
+          RELEASE_TITLE: ${{ steps.notes.outputs.release_title }}
+        run: |
+          set -euo pipefail
+
+          release_id="${{ steps.release.outputs.release_id }}"
+          release_body="$(<release-notes.md)"
+
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+            -f "name=$RELEASE_TITLE" \
+            -f "body=$release_body" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true >/dev/null
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+            --jq '"Published release: " + .html_url'
